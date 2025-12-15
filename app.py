@@ -3,22 +3,18 @@ import pandas as pd
 import streamlit as st
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras.utils import img_to_array
+from tensorflow.keras import layers
 from PIL import Image
-import cv2
 
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Распознавание цветов", page_icon="🌸", layout="wide")
+st.set_page_config(page_title="Распознавание цветов (EfficientNet + Grad-CAM)", page_icon="🌸", layout="wide")
 
 MODEL_PATH = "flower_best.keras"
 IMG_SIZE = 224
 
-# Модель обучалась на этих классах (английские имена — внутренние)
 CLASS_NAMES_EN = ["daisy", "dandelion", "rose", "sunflower", "tulip"]
-
-# Отображение для интерфейса (русские названия + с большой буквы)
 CLASS_NAMES_RU = {
     "daisy": "Ромашка",
     "dandelion": "Одуванчик",
@@ -29,204 +25,207 @@ CLASS_NAMES_RU = {
 
 
 # =========================
-# MODEL LOADING (robust for Grad-CAM)
+# CUSTOM LAYER (нужен для load_model)
+# =========================
+@tf.keras.utils.register_keras_serializable(package="Custom")
+class RandomCutout(layers.Layer):
+    def __init__(self, prob=0.5, ratio=(0.2, 0.4), **kwargs):
+        super().__init__(**kwargs)
+        self.prob = float(prob)
+        self.ratio = tuple(ratio)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"prob": self.prob, "ratio": list(self.ratio)})
+        return cfg
+
+    def call(self, images, training=None):
+        # В инференсе cutout не нужен
+        return images
+
+
+# =========================
+# LOAD MODEL PARTS
 # =========================
 @st.cache_resource
-def load_models():
-    # Загружаем сохранённый Sequential
-    seq = keras.models.load_model(MODEL_PATH, compile=False)
+def load_parts():
+    m = keras.models.load_model(MODEL_PATH, compile=False)
+    _ = m(tf.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32), training=False)
 
-    # "прогрев" — чтобы у Sequential появился граф/inputs/outputs
-    _ = seq(tf.zeros((1, IMG_SIZE, IMG_SIZE, 3), dtype=tf.float32), training=False)
+    # IMPORTANT: для инференса/Grad-CAM не используем data_augmentation и random_cutout
+    backbone = m.get_layer("efficientnetb0")
+    gap = m.get_layer("global_average_pooling2d_3")
+    drop = m.get_layer("dropout_3")
+    head = m.get_layer("dense_3")
+    return m, backbone, gap, drop, head
 
-    # Оборачиваем в Functional-граф на тех же слоях (веса сохраняются)
-    inp = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name="input")
-    x = inp
-    conv_outputs = {}  # имя Conv2D -> тензор выхода
 
-    for layer in seq.layers:
-        x = layer(x)
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            conv_outputs[layer.name] = x
-
-    func = tf.keras.Model(inputs=inp, outputs=x, name="functional_wrapper")
-    return func, conv_outputs
-
-model, conv_outputs_map = load_models()
-CONV_LAYERS = list(conv_outputs_map.keys())
+model, backbone, gap_layer, drop_layer, head_layer = load_parts()
 
 
 # =========================
-# PREPROCESS
+# PREPROCESS (правильно для EfficientNet)
 # =========================
-def preprocess_pil(pil_img: Image.Image):
+def preprocess_pil(pil_img: Image.Image) -> tf.Tensor:
     img = pil_img.convert("RGB").resize((IMG_SIZE, IMG_SIZE))
-    arr = img_to_array(img).astype(np.float32) / 255.0
-    arr = np.expand_dims(arr, axis=0)  # (1, 224, 224, 3)
-    return arr
+    arr = np.array(img).astype("float32")  # 0..255
+    arr = np.expand_dims(arr, axis=0)
+    x = tf.convert_to_tensor(arr, dtype=tf.float32)
+    x = keras.applications.efficientnet.preprocess_input(x)
+    return x
 
 
 # =========================
-# GRAD-CAM
+# HEATMAP COLORS (без matplotlib/cv2)
 # =========================
-def make_gradcam_heatmap(x: tf.Tensor, conv_layer_name: str):
-    conv_out = conv_outputs_map[conv_layer_name]  # тензор из functional-графа
+def jet_like_colormap(gray_u8: np.ndarray) -> np.ndarray:
+    """
+    gray_u8: (H,W) uint8 0..255
+    return: (H,W,3) uint8 (jet-like)
+    """
+    x = gray_u8.astype(np.float32)
+    r = np.clip(2 * x, 0, 255)
+    g = np.clip(255 - np.abs(2 * x - 255), 0, 255)
+    b = np.clip(255 - 2 * x, 0, 255)
+    return np.stack([r, g, b], axis=-1).astype(np.uint8)
 
-    grad_model = tf.keras.Model(
-        inputs=model.inputs,
-        outputs=[conv_out, model.outputs[0]]
-    )
 
+def overlay_heatmap(pil_img: Image.Image, heatmap01: np.ndarray, alpha: float) -> np.ndarray:
+    w, h = pil_img.size
+    hm = Image.fromarray(np.uint8(heatmap01 * 255)).resize((w, h), resample=Image.BILINEAR)
+    hm_u8 = np.array(hm).astype(np.uint8)
+
+    colored = jet_like_colormap(hm_u8).astype(np.float32) / 255.0
+    img = np.array(pil_img.convert("RGB")).astype(np.float32) / 255.0
+
+    out = (1 - alpha) * img + alpha * colored
+    return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+
+# =========================
+# FORWARD + GRAD-CAM (по backbone output)
+# =========================
+def forward_probs(x: tf.Tensor) -> np.ndarray:
+    bb_out = backbone(x, training=False)
+    feat = gap_layer(bb_out)
+    feat = drop_layer(feat, training=False)
+    probs = head_layer(feat)[0].numpy()
+    return probs
+
+
+def gradcam_heatmap_backbone(x: tf.Tensor, class_index: int):
+    """
+    Надёжный Grad-CAM: по выходу backbone (последняя feature map перед GAP)
+    """
     with tf.GradientTape() as tape:
-        conv_outputs, preds = grad_model(x, training=False)
-        tape.watch(conv_outputs)
+        bb_out = backbone(x, training=False)  # (1,H,W,C)
+        tape.watch(bb_out)
 
-        pred_index = tf.argmax(preds[0])
-        score = preds[:, pred_index][0]
+        feat = gap_layer(bb_out)
+        feat = drop_layer(feat, training=False)
+        probs = head_layer(feat)[0]  # softmax
 
-    grads = tape.gradient(score, conv_outputs)
+        # log(prob) даёт более живые градиенты
+        score = tf.math.log(probs[class_index] + 1e-8)
+
+    grads = tape.gradient(score, bb_out)
     if grads is None:
         return None
 
-    conv_outputs = conv_outputs[0]  # (h,w,c)
-    grads = grads[0]                # (h,w,c)
+    bb_out = bb_out[0]   # (H,W,C)
+    grads = grads[0]     # (H,W,C)
 
-    weights = tf.reduce_mean(grads, axis=(0, 1))              # (c,)
-    cam = tf.reduce_sum(conv_outputs * weights, axis=-1)      # (h,w)
+    weights = tf.reduce_mean(grads, axis=(0, 1))          # (C,)
+    cam = tf.reduce_sum(bb_out * weights, axis=-1)        # (H,W)
 
-    cam = tf.maximum(cam, 0)
+    cam = tf.abs(cam)                                    # важный фикс против "всё синее"
     cam = cam / (tf.reduce_max(cam) + 1e-8)
     return cam.numpy()
-
-
-def overlay_heatmap_on_pil(heatmap: np.ndarray, pil_img: Image.Image, alpha=0.40):
-    # resize heatmap to original image size
-    w, h = pil_img.size
-    heatmap_resized = cv2.resize(heatmap, (w, h))
-    heatmap_uint8 = np.uint8(255 * heatmap_resized)
-
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-
-    img_rgb = np.array(pil_img.convert("RGB"))
-    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-
-    overlay_bgr = cv2.addWeighted(heatmap_color, alpha, img_bgr, 1 - alpha, 0)
-    overlay_rgb = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGB)
-    return overlay_rgb
-
-
-def predict_with_gradcam(pil_img: Image.Image, conv_layer_preference: str | None):
-    arr = preprocess_pil(pil_img)
-    x = tf.convert_to_tensor(arr, dtype=tf.float32)
-
-    probs = model(x, training=False)[0].numpy()
-
-    class_idx = int(np.argmax(probs))
-    class_name_en = CLASS_NAMES_EN[class_idx]
-    class_name_ru = CLASS_NAMES_RU.get(class_name_en, class_name_en)
-
-    if not CONV_LAYERS:
-        return class_name_en, class_name_ru, probs, None, None, None
-
-    candidates = []
-    if conv_layer_preference and conv_layer_preference in CONV_LAYERS:
-        candidates.append(conv_layer_preference)
-    candidates += [n for n in reversed(CONV_LAYERS) if n not in candidates]
-
-    for layer_name in candidates:
-        heatmap = make_gradcam_heatmap(x, layer_name)
-        if heatmap is not None:
-            return class_name_en, class_name_ru, probs, heatmap, None, layer_name
-
-    return class_name_en, class_name_ru, probs, None, None, None
 
 
 # =========================
 # UI
 # =========================
 st.title("Распознавание цветов (CNN) + Grad-CAM")
-st.write(
-    "Загрузите фото цветка или сделайте снимок с камеры."
-    " Модель предскажет класс и покажет на какие области изображения она опиралась."
-)
+st.write("Загрузите изображение или сделайте снимок. Grad-CAM показывает зоны, влияющие на решение модели.")
 
 with st.sidebar:
     st.header("Настройки")
+    alpha = st.slider("Наложение heatmap (alpha)", 0.05, 0.90, 0.40, 0.05)
+    img_width = st.slider("Ширина изображения", 300, 900, 520, 10)
 
-    st.markdown("**Классы:**")
-    for k in CLASS_NAMES_EN:
-        st.write(f"- {CLASS_NAMES_RU[k]} ({k})")
-
-    st.divider()
-
-    if CONV_LAYERS:
-        st.markdown("**Слой для Grad-CAM**")
-        default_idx = len(CONV_LAYERS) - 1
-        selected_layer = st.selectbox(
-            "Выберите слой",
-            options=CONV_LAYERS,
-            index=default_idx
-        )
-    else:
-        selected_layer = None
-        st.warning("Conv2D слои не найдены — Grad-CAM отключён.")
-
-    alpha = st.slider("Наложение heatmap (alpha)", 0.0, 0.9, 0.40, 0.05)
-    img_width = st.slider("Ширина изображений", 250, 900, 520, 10)
-
-st.markdown("### Ввод изображения")
 col_upload, col_cam = st.columns(2)
-
 with col_upload:
-    uploaded_file = st.file_uploader("Загрузить изображение (JPG/PNG)", type=["jpg", "jpeg", "png"])
-
+    uploaded = st.file_uploader("Загрузить изображение (JPG/PNG)", type=["jpg", "jpeg", "png"])
 with col_cam:
-    camera_image = st.camera_input("Или сделать снимок с камеры")
+    camera = st.camera_input("Или сделать фото")
 
 pil_image = None
-if camera_image is not None:
-    pil_image = Image.open(camera_image).convert("RGB")
-elif uploaded_file is not None:
-    pil_image = Image.open(uploaded_file).convert("RGB")
+img_bytes = None
+
+if camera is not None:
+    img_bytes = camera.getvalue()
+    pil_image = Image.open(camera).convert("RGB")
+elif uploaded is not None:
+    img_bytes = uploaded.getvalue()
+    pil_image = Image.open(uploaded).convert("RGB")
 
 if pil_image is None:
-    st.info("Пока нет изображения. Загрузи файл или сделай фото.")
+    st.info("Загрузи изображение или сделай фото.")
     st.stop()
 
-# Predict + Grad-CAM
-pred_en, pred_ru, probs, heatmap, overlay, used_layer = predict_with_gradcam(pil_image, selected_layer)
+# Cache по картинке: чтобы при любом клике не пересчитывать probs заново
+if "last_hash" not in st.session_state:
+    st.session_state.last_hash = None
+if "x" not in st.session_state:
+    st.session_state.x = None
+if "probs" not in st.session_state:
+    st.session_state.probs = None
 
-# Если построили heatmap — накладываем с выбранным alpha
-if heatmap is not None:
-    overlay = overlay_heatmap_on_pil(heatmap, pil_image, alpha=alpha)
+h = hash(img_bytes) if img_bytes is not None else None
 
-# Layout
-c1, c2, c3 = st.columns([1.2, 1.2, 1])
+if h != st.session_state.last_hash:
+    st.session_state.last_hash = h
+    st.session_state.x = preprocess_pil(pil_image)
+    with st.spinner("Считаю предсказание..."):
+        st.session_state.probs = forward_probs(st.session_state.x)
+
+x = st.session_state.x
+probs = st.session_state.probs
+
+idx = int(np.argmax(probs))
+class_en = CLASS_NAMES_EN[idx]
+class_ru = CLASS_NAMES_RU[class_en]
+
+with st.spinner("Строю Grad-CAM..."):
+    hm = gradcam_heatmap_backbone(x, idx)
+
+overlay = None
+if hm is not None:
+    overlay = overlay_heatmap(pil_image, hm, alpha=alpha)
+
+c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
 
 with c1:
-    st.markdown("### Оригинал")
+    st.subheader("Оригинал")
     st.image(pil_image, width=img_width)
 
 with c2:
-    st.markdown("### Grad-CAM")
+    st.subheader("Grad-CAM")
     if overlay is None:
-        st.warning("Grad-CAM не удалось построить. Попробуй другой conv-слой в сайдбаре.")
+        st.warning("Grad-CAM не удалось построить.")
     else:
         st.image(overlay, width=img_width)
-        st.caption(f"Использованный слой: `{used_layer}`")
+        st.caption("Grad-CAM построен по выходу backbone (последняя feature map перед GAP).")
 
 with c3:
-    st.markdown("### Предсказание")
-    st.markdown(f"**Класс:** {pred_ru}")
-    st.caption(f"Англ.: {pred_en}")
+    st.subheader("Результат")
+    st.markdown(f"### {class_ru}")
+    st.caption(f"({class_en})")
 
-    df = pd.DataFrame({
-        "Класс": [CLASS_NAMES_RU[c] for c in CLASS_NAMES_EN],
-        "Вероятность": probs
-    }).set_index("Класс")
+    df = pd.DataFrame(
+        {"Класс": [CLASS_NAMES_RU[c] for c in CLASS_NAMES_EN], "Вероятность": probs}
+    ).set_index("Класс")
 
     st.bar_chart(df)
-
-    st.caption(
-        "Тёплые зоны на Grad-CAM показывают области, которые сильнее всего повлияли на решение модели."
-    )
+    st.caption("Тёплые зоны = модель сильнее опиралась на эти части изображения.")
